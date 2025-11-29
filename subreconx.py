@@ -9,8 +9,15 @@ import subprocess
 import sys
 import os
 import argparse
+import socket
 import concurrent.futures
 from datetime import datetime
+
+try:
+    import requests
+except ImportError:
+    print("[!] Requests not installed. Run: pip install requests")
+    sys.exit(1)
 
 try:
     from rich.console import Console
@@ -80,18 +87,69 @@ def run_subfinder(domain):
 # PING CHECK
 # ============================================================================
 
-def ping_single(subdomain):
-    """Ping a single subdomain"""
+def get_ip_address(subdomain):
+    """Get IP address from subdomain"""
     try:
-        result = subprocess.run(
+        ip = socket.gethostbyname(subdomain)
+        return ip
+    except:
+        return None
+
+def get_http_status(subdomain, timeout=5):
+    """Get HTTP status code"""
+    try:
+        response = requests.get(f"https://{subdomain}", timeout=timeout, allow_redirects=True, verify=False)
+        return response.status_code, "https"
+    except:
+        pass
+    
+    try:
+        response = requests.get(f"http://{subdomain}", timeout=timeout, allow_redirects=True)
+        return response.status_code, "http"
+    except:
+        pass
+    
+    return None, None
+
+def ping_single(subdomain):
+    """Ping a single subdomain and gather info"""
+    result = {
+        'subdomain': subdomain,
+        'ip': None,
+        'status_code': None,
+        'protocol': None,
+        'online': False
+    }
+    
+    # Get IP
+    result['ip'] = get_ip_address(subdomain)
+    
+    # Ping check
+    try:
+        ping_result = subprocess.run(
             ["ping", "-c", "1", "-W", "2", subdomain],
             capture_output=True,
             text=True,
             timeout=5
         )
-        return subdomain, result.returncode == 0
+        result['online'] = ping_result.returncode == 0
     except:
-        return subdomain, False
+        result['online'] = False
+    
+    # If has IP but ping failed, still consider it might be online (ICMP blocked)
+    if result['ip'] and not result['online']:
+        status, proto = get_http_status(subdomain)
+        if status:
+            result['online'] = True
+            result['status_code'] = status
+            result['protocol'] = proto
+    elif result['online']:
+        # Get HTTP status for online hosts
+        status, proto = get_http_status(subdomain)
+        result['status_code'] = status
+        result['protocol'] = proto
+    
+    return result
 
 def check_online_subdomains(subdomains):
     """Check which subdomains are online using max threads"""
@@ -102,6 +160,10 @@ def check_online_subdomains(subdomains):
     # Use max CPU cores
     max_threads = os.cpu_count() or 10
     
+    # Disable SSL warnings
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    
     with Progress(
         SpinnerColumn(style="red"),
         TextColumn("[bold white]{task.description}[/bold white]"),
@@ -110,17 +172,17 @@ def check_online_subdomains(subdomains):
         TimeElapsedColumn(),
         console=console
     ) as progress:
-        task = progress.add_task("Pinging subdomains...", total=len(subdomains))
+        task = progress.add_task("Checking subdomains...", total=len(subdomains))
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
             futures = {executor.submit(ping_single, sub): sub for sub in subdomains}
             
             for future in concurrent.futures.as_completed(futures):
-                subdomain, is_online = future.result()
-                if is_online:
-                    online.append(subdomain)
+                result = future.result()
+                if result['online']:
+                    online.append(result)
                 else:
-                    offline.append(subdomain)
+                    offline.append(result)
                 progress.advance(task)
     
     return online, offline
@@ -170,16 +232,23 @@ def run_parallel_nmap(online_subdomains, parallel_count=5):
     total = len(online_subdomains)
     completed = 0
     
+    # Create a map of subdomain to IP
+    subdomain_to_ip = {sub['subdomain']: sub['ip'] for sub in online_subdomains}
+    subdomain_list = [sub['subdomain'] for sub in online_subdomains]
+    
     with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_count) as executor:
-        futures = {executor.submit(nmap_scan, sub): sub for sub in online_subdomains}
+        futures = {executor.submit(nmap_scan, sub): sub for sub in subdomain_list}
         
         for future in concurrent.futures.as_completed(futures):
             subdomain, result = future.result()
             scan_results[subdomain] = result
             completed += 1
             
+            # Get IP for this subdomain
+            ip = subdomain_to_ip.get(subdomain)
+            
             # Display result immediately
-            display_scan_result(subdomain, result, completed, total)
+            display_scan_result(subdomain, ip, result, completed, total)
     
     return scan_results
 
@@ -206,7 +275,7 @@ def display_subdomains(subdomains, domain):
     console.print(table)
 
 def display_online_status(online, offline):
-    """Display online/offline status"""
+    """Display online/offline status with IP and status code"""
     
     # Online table
     if online:
@@ -217,12 +286,17 @@ def display_online_status(online, offline):
             border_style="green"
         )
         
-        table.add_column("#", style="green", width=6)
+        table.add_column("#", style="green", width=4)
         table.add_column("Subdomain", style="white")
-        table.add_column("Status", style="green")
+        table.add_column("IP Address", style="cyan")
+        table.add_column("Status", style="yellow", width=8)
+        table.add_column("Protocol", style="magenta", width=8)
         
         for i, sub in enumerate(online, 1):
-            table.add_row(str(i), sub, "● ONLINE")
+            status = str(sub['status_code']) if sub['status_code'] else "-"
+            proto = sub['protocol'] if sub['protocol'] else "-"
+            ip = sub['ip'] if sub['ip'] else "-"
+            table.add_row(str(i), sub['subdomain'], ip, status, proto)
         
         console.print(table)
     
@@ -235,22 +309,25 @@ def display_online_status(online, offline):
             border_style="red"
         )
         
-        table.add_column("#", style="red", width=6)
+        table.add_column("#", style="red", width=4)
         table.add_column("Subdomain", style="dim white")
-        table.add_column("Status", style="red")
+        table.add_column("IP Address", style="dim cyan")
+        table.add_column("Status", style="dim red")
         
         for i, sub in enumerate(offline, 1):
-            table.add_row(str(i), sub, "○ OFFLINE")
+            ip = sub['ip'] if sub['ip'] else "No DNS"
+            table.add_row(str(i), sub['subdomain'], ip, "OFFLINE")
         
         console.print(table)
 
-def display_scan_result(subdomain, nmap_output, index, total):
-    """Display single nmap scan result immediately"""
+def display_scan_result(subdomain, ip, nmap_output, index, total):
+    """Display single nmap scan result immediately with IP"""
     
     ports = parse_nmap_output(nmap_output)
     
-    console.print(f"\n[bold red][{index}/{total}][/bold red] [white]Scan Complete:[/white] [bold red]{subdomain}[/bold red]")
-    console.print("[dim]" + "-" * 50 + "[/dim]")
+    ip_display = ip if ip else "Unknown"
+    console.print(f"\n[bold red][{index}/{total}][/bold red] [white]Scan Complete:[/white] [bold red]{subdomain}[/bold red] [dim]({ip_display})[/dim]")
+    console.print("[dim]" + "-" * 60 + "[/dim]")
     
     if ports:
         table = Table(
@@ -300,19 +377,30 @@ def save_results(domain, subdomains, online, offline, scan_results, filename):
             f.write(f"\n[ONLINE: {len(online)}]\n")
             f.write("-" * 50 + "\n")
             for sub in online:
-                f.write(f"  [UP] {sub}\n")
+                ip = sub['ip'] if sub['ip'] else "No IP"
+                status = sub['status_code'] if sub['status_code'] else "-"
+                proto = sub['protocol'] if sub['protocol'] else "-"
+                f.write(f"  [UP] {sub['subdomain']} | IP: {ip} | Status: {status} | {proto}\n")
         
         if offline:
             f.write(f"\n[OFFLINE: {len(offline)}]\n")
             f.write("-" * 50 + "\n")
             for sub in offline:
-                f.write(f"  [DOWN] {sub}\n")
+                ip = sub['ip'] if sub['ip'] else "No DNS"
+                f.write(f"  [DOWN] {sub['subdomain']} | IP: {ip}\n")
         
         if scan_results:
             f.write(f"\n[NMAP SCAN RESULTS]\n")
             f.write("=" * 70 + "\n")
             for subdomain, result in scan_results.items():
-                f.write(f"\n--- {subdomain} ---\n")
+                # Find IP for this subdomain
+                ip = None
+                for sub in online:
+                    if sub['subdomain'] == subdomain:
+                        ip = sub['ip']
+                        break
+                ip_str = ip if ip else "Unknown"
+                f.write(f"\n--- {subdomain} ({ip_str}) ---\n")
                 f.write(result)
                 f.write("\n")
         
